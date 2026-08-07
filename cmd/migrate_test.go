@@ -20,11 +20,14 @@
 package cmd_test
 
 import (
+	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/cloudspannerecosystem/wrench/cmd"
+	"github.com/spf13/cobra"
 )
 
 func TestCreateMigrationFile(t *testing.T) {
@@ -49,7 +52,7 @@ func TestCreateMigrationFile(t *testing.T) {
 
 	for _, tc := range testcases {
 		t.Run(tc.filename, func(t *testing.T) {
-			filename, err := cmd.CreateMigrationFile(testdatadir, tc.filename, tc.digits)
+			filename, err := cmd.CreateMigrationFile(context.Background(), testdatadir, tc.filename, tc.digits)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -64,9 +67,82 @@ func TestCreateMigrationFile(t *testing.T) {
 	}
 
 	t.Run("invalid name", func(t *testing.T) {
-		_, err := cmd.CreateMigrationFile(testdatadir, "あああ", 6)
+		_, err := cmd.CreateMigrationFile(context.Background(), testdatadir, "あああ", 6)
 		if err.Error() != "Invalid migration file name." {
 			t.Errorf("err want `invalid name`, but got `%v`", err)
 		}
 	})
+}
+
+func TestGetMigrationTableName(t *testing.T) {
+	tests := []struct {
+		name      string
+		flagValue string
+		want      string
+		wantErr   bool
+	}{
+		{
+			name:      "default value",
+			flagValue: "SchemaMigrations",
+			want:      "SchemaMigrations",
+		},
+		{
+			name:      "custom table name",
+			flagValue: "DataMigrations",
+			want:      "DataMigrations",
+		},
+		{
+			name:      "table name with underscore and digits",
+			flagValue: "Data_Migrations2",
+			want:      "Data_Migrations2",
+		},
+		{
+			name:      "empty value falls back to default",
+			flagValue: "",
+			want:      "SchemaMigrations",
+		},
+		{
+			name:      "table name starting with digit",
+			flagValue: "1Migrations",
+			wantErr:   true,
+		},
+		{
+			name:      "table name with invalid character",
+			flagValue: "Data-Migrations",
+			wantErr:   true,
+		},
+		{
+			name:      "table name with SQL injection",
+			flagValue: "SchemaMigrations` WHERE FALSE UNION ALL SELECT 1, FALSE FROM `SchemaMigrations",
+			wantErr:   true,
+		},
+		{
+			name:      "too long table name",
+			flagValue: strings.Repeat("A", 129),
+			wantErr:   true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &cobra.Command{}
+			c.Flags().String("migration_table_name", "SchemaMigrations", "")
+			if err := c.Flags().Set("migration_table_name", tc.flagValue); err != nil {
+				t.Fatal(err)
+			}
+
+			got, err := cmd.GetMigrationTableName(c)
+			if tc.wantErr {
+				if err == nil {
+					t.Errorf("want error, but got nil (value: %s)", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("want no error, but got %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("want %s, but got %s", tc.want, got)
+			}
+		})
+	}
 }

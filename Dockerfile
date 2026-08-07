@@ -1,15 +1,6 @@
-FROM golang:1.21 as build
+FROM gcr.io/distroless/static-debian12
 
-ARG VERSION
+# The binary is built by goreleaser
+COPY wrench /
 
-WORKDIR /go/src/app
-COPY . .
-
-RUN go mod download
-RUN CGO_ENABLED=0 go build \
-    -ldflags "-s -w -X github.com/cloudspannerecosystem/wrench/cmd.version=${VERSION}" \
-    -o /go/bin/app/wrench
-
-FROM gcr.io/distroless/static-debian11
-COPY --from=build /go/bin/app/wrench /
 ENTRYPOINT ["/wrench"]

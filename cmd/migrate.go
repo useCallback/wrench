@@ -28,13 +28,13 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/cloudspannerecosystem/wrench/internal/fs"
 	"github.com/cloudspannerecosystem/wrench/pkg/spanner"
 	"github.com/spf13/cobra"
 )
 
 const (
-	migrationsDirName  = "migrations"
-	migrationTableName = "SchemaMigrations"
+	migrationsDirName = "migrations"
 )
 
 // migrateCmd represents the migrate command
@@ -65,6 +65,8 @@ func init() {
 		RunE:  migrateSet,
 	}
 
+	migrateUpCmd.Flags().String(flagProtoDescriptorFile, "", "Proto descriptor file to be used with migrations")
+
 	migrateCmd.AddCommand(
 		migrateCreateCmd,
 		migrateUpCmd,
@@ -73,6 +75,9 @@ func init() {
 	)
 
 	migrateCmd.PersistentFlags().String(flagNameDirectory, "", "Directory that migration files placed (required)")
+	migrateCmd.PersistentFlags().String(flagMigrationTableName, defaultMigrationTableName, "Name of the migration tracking table")
+
+	migrateUpCmd.PersistentFlags().StringVar(&priority, flagPriority, "", "The priority to apply DML (optional)")
 }
 
 func migrateCreate(c *cobra.Command, args []string) error {
@@ -93,7 +98,7 @@ func migrateCreate(c *cobra.Command, args []string) error {
 		}
 	}
 
-	filename, err := createMigrationFile(dir, name, 6)
+	filename, err := createMigrationFile(c.Context(), dir, name, 6)
 	if err != nil {
 		return &Error{
 			cmd: c,
@@ -122,6 +127,22 @@ func migrateUp(c *cobra.Command, args []string) error {
 		limit = n
 	}
 
+	priorityType, err := priorityTypeOf(priority)
+	if err != nil {
+		return &Error{
+			cmd: c,
+			err: err,
+		}
+	}
+
+	migrationTableName, err := getMigrationTableName(c)
+	if err != nil {
+		return &Error{
+			cmd: c,
+			err: err,
+		}
+	}
+
 	client, err := newSpannerClient(ctx, c)
 	if err != nil {
 		return err
@@ -136,7 +157,7 @@ func migrateUp(c *cobra.Command, args []string) error {
 	}
 
 	dir := filepath.Join(c.Flag(flagNameDirectory).Value.String(), migrationsDirName)
-	migrations, err := spanner.LoadMigrations(dir)
+	migrations, err := spanner.ReadMigrations(ctx, dir)
 	if err != nil {
 		return &Error{
 			cmd: c,
@@ -144,12 +165,32 @@ func migrateUp(c *cobra.Command, args []string) error {
 		}
 	}
 
-	return client.ExecuteMigrations(ctx, migrations, limit, migrationTableName)
+	var protoDescriptor []byte
+	protoDescriptorFile := protoDescriptorFilePath(c)
+	if protoDescriptorFile != "" {
+		protoDescriptor, err = fs.ReadFile(ctx, protoDescriptorFile)
+		if err != nil {
+			return &Error{
+				err: err,
+				cmd: c,
+			}
+		}
+	}
+
+	return client.ExecuteMigrations(ctx, migrations, limit, migrationTableName, priorityType, protoDescriptor)
 }
 
 func migrateVersion(c *cobra.Command, _ []string) error {
 	ctx, cancel := context.WithTimeout(c.Context(), timeout)
 	defer cancel()
+
+	migrationTableName, err := getMigrationTableName(c)
+	if err != nil {
+		return &Error{
+			cmd: c,
+			err: err,
+		}
+	}
 
 	client, err := newSpannerClient(ctx, c)
 	if err != nil {
@@ -200,6 +241,14 @@ func migrateSet(c *cobra.Command, args []string) error {
 		}
 	}
 
+	migrationTableName, err := getMigrationTableName(c)
+	if err != nil {
+		return &Error{
+			cmd: c,
+			err: err,
+		}
+	}
+
 	client, err := newSpannerClient(ctx, c)
 	if err != nil {
 		return err
@@ -223,12 +272,12 @@ func migrateSet(c *cobra.Command, args []string) error {
 	return nil
 }
 
-func createMigrationFile(dir string, name string, digits int) (string, error) {
+func createMigrationFile(ctx context.Context, dir string, name string, digits int) (string, error) {
 	if name != "" && !spanner.MigrationNameRegex.MatchString(name) {
 		return "", errors.New("Invalid migration file name.")
 	}
 
-	ms, err := spanner.LoadMigrations(dir)
+	ms, err := spanner.ReadMigrations(ctx, dir)
 	if err != nil {
 		return "", err
 	}

@@ -21,8 +21,7 @@ package cmd
 
 import (
 	"context"
-	"os"
-
+	"github.com/cloudspannerecosystem/wrench/internal/fs"
 	"github.com/spf13/cobra"
 )
 
@@ -43,7 +42,7 @@ func create(c *cobra.Command, _ []string) error {
 	defer client.Close()
 
 	filename := schemaFilePath(c)
-	ddl, err := os.ReadFile(filename)
+	ddl, err := fs.ReadFile(ctx, filename)
 	if err != nil {
 		return &Error{
 			err: err,
@@ -51,7 +50,19 @@ func create(c *cobra.Command, _ []string) error {
 		}
 	}
 
-	err = client.CreateDatabase(ctx, filename, ddl)
+	var protoDescriptor []byte
+	protoDescriptorFile := protoDescriptorFilePath(c)
+	if protoDescriptorFile != "" {
+		protoDescriptor, err = fs.ReadFile(ctx, protoDescriptorFile)
+		if err != nil {
+			return &Error{
+				err: err,
+				cmd: c,
+			}
+		}
+	}
+
+	err = client.CreateDatabase(ctx, filename, ddl, protoDescriptor)
 	if err != nil {
 		return &Error{
 			err: err,
@@ -60,4 +71,8 @@ func create(c *cobra.Command, _ []string) error {
 	}
 
 	return nil
+}
+
+func init() {
+	createCmd.Flags().String(flagProtoDescriptorFile, "", "Proto descriptor file to be used with database creation")
 }

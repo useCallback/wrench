@@ -46,7 +46,7 @@ CREATE TABLE Singers (
 ## Installation
 
 Get binary from [release page](https://github.com/cloudspannerecosystem/wrench/releases).
-Or, you can use Docker container: [mercari/wrench](https://hub.docker.com/r/mercari/wrench).
+Or, you can use [Docker image from packages.](https://github.com/cloudspannerecosystem/wrench/pkgs/container/wrench)
 
 ## Usage
 
@@ -108,6 +108,24 @@ $ wrench migrate up --directory ./_examples
 
 This executes migrations. This also creates `SchemaMigrations` table into your database to manage schema version if it does not exist.
 
+### Use custom migration table
+
+By default, wrench uses `SchemaMigrations` table to manage migration versions. You can specify a custom table name using `--migration_table_name` flag:
+
+```sh
+$ wrench migrate up --directory ./_examples --migration_table_name DataMigrations
+```
+
+The table name must start with a letter and contain only letters, numbers and underscores.
+
+This is useful when you want to manage multiple migration systems in one database (e.g., schema migrations and data migrations separately). Note that the same `--migration_table_name` value must be given to `migrate up`, `migrate version`, `migrate set` and `truncate`, otherwise they operate on the default `SchemaMigrations` table.
+
+`truncate` keeps the migration table so that the database keeps its migration version. If you use a custom table name, pass it to `truncate` as well, otherwise the migration version is deleted:
+
+```sh
+$ wrench truncate --migration_table_name DataMigrations
+```
+
 ### Apply single DDL/DML
 
 ```sh
@@ -118,6 +136,23 @@ This applies single DDL or DML.
 
 Use `wrench [command] --help` for more information about a command.
 
+### Embed migrations file to 1 binary
+
+`github.com/cloudspannerecosystem/wrench/cmd.CustomFileSystemFunc` is used to embed migration files into one binary.
+By default, `os.DirFS(".")` is used to read files.
+If you want to use a custom file system, you can create a custom wrench binary with overwrite this value.
+For example, you can use `embed.FS` to read files to create custom binary like below.
+
+```go
+//go:embed schema.sql migrations/*.sql
+var SpannerSchemaFS embed.FS
+
+func init() {
+    cmd.CustomFileSystemFunc = func() fs.FS {
+        return SpannerSchemaFS
+    }
+}
+```
 
 ## Contributions
 

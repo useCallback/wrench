@@ -24,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 
 	"cloud.google.com/go/spanner"
 	databasev1 "cloud.google.com/go/spanner/admin/database/apiv1"
@@ -59,7 +60,19 @@ func NewClient(ctx context.Context, config *Config) (*Client, error) {
 		opts = append(opts, option.WithCredentialsFile(config.CredentialsFile))
 	}
 
-	spannerClient, err := spanner.NewClient(ctx, config.URL(), opts...)
+	spannerClient, err := spanner.NewClientWithConfig(ctx, config.URL(),
+		spanner.ClientConfig{
+			SessionPoolConfig: spanner.SessionPoolConfig{
+				MaxOpened:                         spanner.DefaultSessionPoolConfig.MaxOpened,
+				MinOpened:                         1,
+				MaxIdle:                           spanner.DefaultSessionPoolConfig.MaxIdle,
+				HealthCheckWorkers:                spanner.DefaultSessionPoolConfig.HealthCheckWorkers,
+				HealthCheckInterval:               spanner.DefaultSessionPoolConfig.HealthCheckInterval,
+				TrackSessionHandles:               false,
+				InactiveTransactionRemovalOptions: spanner.DefaultSessionPoolConfig.InactiveTransactionRemovalOptions,
+			},
+		},
+		opts...)
 	if err != nil {
 		return nil, &Error{
 			Code: ErrorCodeCreateClient,
@@ -83,7 +96,7 @@ func NewClient(ctx context.Context, config *Config) (*Client, error) {
 	}, nil
 }
 
-func (c *Client) CreateDatabase(ctx context.Context, filename string, ddl []byte) error {
+func (c *Client) CreateDatabase(ctx context.Context, filename string, ddl []byte, protoDescriptors []byte) error {
 	statements, err := ddlToStatements(filename, ddl)
 	if err != nil {
 		return &Error{
@@ -93,9 +106,10 @@ func (c *Client) CreateDatabase(ctx context.Context, filename string, ddl []byte
 	}
 
 	createReq := &databasepb.CreateDatabaseRequest{
-		Parent:          fmt.Sprintf("projects/%s/instances/%s", c.config.Project, c.config.Instance),
-		CreateStatement: fmt.Sprintf("CREATE DATABASE `%s`", c.config.Database),
-		ExtraStatements: statements,
+		Parent:           fmt.Sprintf("projects/%s/instances/%s", c.config.Project, c.config.Instance),
+		CreateStatement:  fmt.Sprintf("CREATE DATABASE `%s`", c.config.Database),
+		ExtraStatements:  statements,
+		ProtoDescriptors: protoDescriptors,
 	}
 
 	op, err := c.spannerAdminClient.CreateDatabase(ctx, createReq)
@@ -130,7 +144,9 @@ func (c *Client) DropDatabase(ctx context.Context) error {
 	return nil
 }
 
-func (c *Client) TruncateAllTables(ctx context.Context) error {
+// TruncateAllTables deletes all rows of all tables except the migration table
+// named migrationTableName, so that the database keeps its migration version.
+func (c *Client) TruncateAllTables(ctx context.Context, migrationTableName string) error {
 	var stms []spanner.Statement
 
 	ri := c.spannerClient.Single().Query(ctx, spanner.Statement{
@@ -142,7 +158,9 @@ func (c *Client) TruncateAllTables(ctx context.Context) error {
 			return err
 		}
 
-		if t.TableName == "SchemaMigrations" {
+		// Cloud Spanner identifiers are case insensitive, while INFORMATION_SCHEMA
+		// returns the name as it was declared.
+		if strings.EqualFold(t.TableName, migrationTableName) {
 			return nil
 		}
 
@@ -174,12 +192,12 @@ func (c *Client) TruncateAllTables(ctx context.Context) error {
 	return nil
 }
 
-func (c *Client) LoadDDL(ctx context.Context) ([]byte, error) {
+func (c *Client) LoadDDL(ctx context.Context) ([]byte, []byte, error) {
 	req := &databasepb.GetDatabaseDdlRequest{Database: c.config.URL()}
 
 	res, err := c.spannerAdminClient.GetDatabaseDdl(ctx, req)
 	if err != nil {
-		return nil, &Error{
+		return nil, nil, &Error{
 			Code: ErrorCodeLoadSchema,
 			err:  err,
 		}
@@ -197,22 +215,23 @@ func (c *Client) LoadDDL(ctx context.Context) ([]byte, error) {
 		schema = append(schema[:], []byte(statement)[:]...)
 	}
 
-	return schema, nil
+	return schema, res.ProtoDescriptors, nil
 }
 
-func (c *Client) ApplyDDLFile(ctx context.Context, filename string, ddl []byte) error {
+func (c *Client) ApplyDDLFile(ctx context.Context, filename string, ddl []byte, protoDescriptors []byte) error {
 	statements, err := ddlToStatements(filename, ddl)
 	if err != nil {
 		return err
 	}
 
-	return c.ApplyDDL(ctx, statements)
+	return c.ApplyDDL(ctx, statements, protoDescriptors)
 }
 
-func (c *Client) ApplyDDL(ctx context.Context, statements []string) error {
+func (c *Client) ApplyDDL(ctx context.Context, statements []string, protoDescriptors []byte) error {
 	req := &databasepb.UpdateDatabaseDdlRequest{
-		Database:   c.config.URL(),
-		Statements: statements,
+		Database:         c.config.URL(),
+		Statements:       statements,
+		ProtoDescriptors: protoDescriptors,
 	}
 
 	op, err := c.spannerAdminClient.UpdateDatabaseDdl(ctx, req)
@@ -314,7 +333,7 @@ func (c *Client) ApplyPartitionedDML(ctx context.Context, statements []string, p
 	return numAffectedRows, nil
 }
 
-func (c *Client) ExecuteMigrations(ctx context.Context, migrations Migrations, limit int, tableName string) error {
+func (c *Client) ExecuteMigrations(ctx context.Context, migrations Migrations, limit int, tableName string, priorityType PriorityType, protoDescriptors []byte) error {
 	sort.Sort(migrations)
 
 	version, dirty, err := c.GetSchemaMigrationVersion(ctx, tableName)
@@ -354,21 +373,21 @@ func (c *Client) ExecuteMigrations(ctx context.Context, migrations Migrations, l
 
 		switch m.kind {
 		case statementKindDDL:
-			if err := c.ApplyDDL(ctx, m.Statements); err != nil {
+			if err := c.ApplyDDL(ctx, m.Statements, protoDescriptors); err != nil {
 				return &Error{
 					Code: ErrorCodeExecuteMigrations,
 					err:  err,
 				}
 			}
 		case statementKindDML:
-			if _, err := c.ApplyDML(ctx, m.Statements, PriorityTypeUnspecified); err != nil {
+			if _, err := c.ApplyDML(ctx, m.Statements, priorityType); err != nil {
 				return &Error{
 					Code: ErrorCodeExecuteMigrations,
 					err:  err,
 				}
 			}
 		case statementKindPartitionedDML:
-			if _, err := c.ApplyPartitionedDML(ctx, m.Statements, PriorityTypeUnspecified); err != nil {
+			if _, err := c.ApplyPartitionedDML(ctx, m.Statements, priorityType); err != nil {
 				return &Error{
 					Code: ErrorCodeExecuteMigrations,
 					err:  err,
@@ -409,7 +428,7 @@ func (c *Client) ExecuteMigrations(ctx context.Context, migrations Migrations, l
 
 func (c *Client) GetSchemaMigrationVersion(ctx context.Context, tableName string) (uint, bool, error) {
 	stmt := spanner.Statement{
-		SQL: `SELECT Version, Dirty FROM ` + tableName + ` LIMIT 1`,
+		SQL: fmt.Sprintf("SELECT Version, Dirty FROM `%s` LIMIT 1", tableName),
 	}
 	iter := c.spannerClient.Single().Query(ctx, stmt)
 	defer iter.Stop()
@@ -473,12 +492,12 @@ func (c *Client) EnsureMigrationTable(ctx context.Context, tableName string) err
 		return nil
 	}
 
-	stmt := fmt.Sprintf(`CREATE TABLE %s (
+	stmt := fmt.Sprintf("CREATE TABLE `%s` ("+`
     Version INT64 NOT NULL,
     Dirty    BOOL NOT NULL
 	) PRIMARY KEY(Version)`, tableName)
 
-	return c.ApplyDDL(ctx, []string{stmt})
+	return c.ApplyDDL(ctx, []string{stmt}, nil)
 }
 
 func (c *Client) Close() error {

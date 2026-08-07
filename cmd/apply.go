@@ -23,8 +23,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
-
+	"github.com/cloudspannerecosystem/wrench/internal/fs"
 	"github.com/cloudspannerecosystem/wrench/pkg/spanner"
 	"github.com/spf13/cobra"
 )
@@ -57,7 +56,7 @@ func apply(c *cobra.Command, _ []string) error {
 			return errors.New("cannot specify DDL and DML at same time")
 		}
 
-		ddl, err := os.ReadFile(ddlFile)
+		ddl, err := fs.ReadFile(ctx, ddlFile)
 		if err != nil {
 			return &Error{
 				err: err,
@@ -65,7 +64,19 @@ func apply(c *cobra.Command, _ []string) error {
 			}
 		}
 
-		err = client.ApplyDDLFile(ctx, ddlFile, ddl)
+		var protoDescriptor []byte
+		protoDescriptorFile := protoDescriptorFilePath(c)
+		if protoDescriptorFile != "" {
+			protoDescriptor, err = fs.ReadFile(ctx, protoDescriptorFile)
+			if err != nil {
+				return &Error{
+					err: err,
+					cmd: c,
+				}
+			}
+		}
+
+		err = client.ApplyDDLFile(ctx, ddlFile, ddl, protoDescriptor)
 		if err != nil {
 			return &Error{
 				err: err,
@@ -81,7 +92,7 @@ func apply(c *cobra.Command, _ []string) error {
 	}
 
 	// apply dml
-	dml, err := os.ReadFile(dmlFile)
+	dml, err := fs.ReadFile(ctx, dmlFile)
 	if err != nil {
 		return &Error{
 			err: err,
@@ -138,4 +149,5 @@ func init() {
 	applyCmd.PersistentFlags().StringVar(&dmlFile, flagDMLFile, "", "DML file to be applied")
 	applyCmd.PersistentFlags().BoolVar(&partitioned, flagPartitioned, false, "Whether given DML should be executed as a Partitioned-DML or not")
 	applyCmd.PersistentFlags().StringVar(&priority, flagPriority, "", "The priority to apply DML(optional)")
+	applyCmd.PersistentFlags().String(flagProtoDescriptorFile, "", "Proto descriptor file to be used with DDL operations")
 }
